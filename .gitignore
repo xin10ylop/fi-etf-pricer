@@ -1,0 +1,14 @@
+# Credentials and config
+factset_config.json
+.env
+
+# Databases
+*.db
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.venv/

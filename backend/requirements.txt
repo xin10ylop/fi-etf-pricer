@@ -1,0 +1,15 @@
+# Treasury ETF pricer backend dependencies.
+# fds.sdk packages are intentionally omitted: the FactSet cross-check is optional
+# and imported lazily, so the tool runs fully without them. Install them only if
+# you enable the FactSet path (FACTSET_ENABLED=1).
+
+fastapi>=0.110
+uvicorn[standard]>=0.29
+yfinance>=0.2.40
+requests>=2.31
+pandas>=2.2
+numpy>=1.26
+python-dateutil>=2.9
+schedule>=1.2
+rich>=13.7
+pydantic>=2.6

@@ -1,0 +1,10 @@
+# Netlify configuration for the static dashboard.
+# The dashboard is a single file under frontend/, so that directory is published.
+# Caching is disabled so a freshly deployed dashboard is always served.
+[build]
+  publish = "frontend"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+  Cache-Control = "no-cache"
