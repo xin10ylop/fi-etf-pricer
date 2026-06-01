@@ -1,9 +1,11 @@
-"""FastAPI application: REST endpoints and the daily repricing scheduler.
+"""FastAPI application: REST endpoints, the dashboard, and the daily scheduler.
 
-The frontend is a static single page hosted separately (Netlify), so CORS is open
-to all origins. The scheduler runs in a background thread, repricing the whole
-watchlist once a day after the Treasury curve is published, while FastAPI keeps
-serving requests.
+The whole app runs from one address and one port: FastAPI serves the dashboard
+at the root path and the REST API under /api, and the dashboard calls the API
+with same-origin relative paths. CORS is still open so the dashboard can also be
+hosted elsewhere (for example Netlify) against this same backend. The scheduler
+runs in a background thread, repricing the whole watchlist once a day after the
+Treasury curve is published, while FastAPI keeps serving requests.
 
 Every response that carries a price or NAV also carries the curve date and a
 valuation timestamp, preserving the contemporaneous end-of-day design end to end.
@@ -14,10 +16,12 @@ from __future__ import annotations
 import threading
 import time
 from datetime import date, datetime
+from pathlib import Path
 
 import schedule
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from rich.console import Console
 
@@ -32,6 +36,11 @@ from .pcf_loader import build_pcf_url
 
 console = Console()
 
+# The single-file dashboard lives alongside the backend in the repo. We resolve
+# its path relative to this module so it serves correctly regardless of the
+# working directory uvicorn is launched from.
+FRONTEND_INDEX = Path(__file__).resolve().parent.parent / "frontend" / "index.html"
+
 app = FastAPI(
     title="Treasury ETF Pricer",
     description=(
@@ -41,7 +50,9 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Open CORS so the Netlify-hosted frontend can call this API from any origin.
+# Open CORS so the dashboard can call this API from any origin. When served from
+# this same app the calls are same-origin and CORS is not exercised, but leaving
+# it open keeps a separately hosted dashboard working too.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,6 +60,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
+
+
+@app.get("/", include_in_schema=False)
+def serve_dashboard() -> FileResponse:
+    """Serve the single-file dashboard at the root path.
+
+    Visiting the server address shows the dashboard directly, so the whole app
+    runs from one address and one port: the page and the API it calls share the
+    same origin.
+    """
+    if not FRONTEND_INDEX.exists():
+        raise HTTPException(status_code=404, detail="Dashboard file not found")
+    return FileResponse(FRONTEND_INDEX, media_type="text/html")
 
 
 # ---------------------------------------------------------------------------

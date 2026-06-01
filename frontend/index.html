@@ -174,9 +174,12 @@
 </div>
 
 <script>
-// API base. Override by setting window.API_BASE before this script, or edit here
-// to point at the deployed backend (e.g. a DigitalOcean host).
-const API_BASE = window.API_BASE || "http://localhost:8000";
+// API base. Empty by default so the dashboard calls the API with same-origin
+// relative paths: the page and the API are served by the same FastAPI app on one
+// address and port. To point the dashboard at a separately hosted backend (for
+// example a Netlify-hosted page calling a remote API), set window.API_BASE to
+// that backend's URL before this script runs.
+const API_BASE = window.API_BASE || "";
 
 let selectedTicker = null;
 let historyChart = null;
