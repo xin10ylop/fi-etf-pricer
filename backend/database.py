@@ -8,6 +8,12 @@ A uniqueness constraint on (ticker, cusip, curve_date) in the marks table is the
 single most important integrity guard here: it stops the basket NAV sum from
 fanning out if a join ever produced duplicate mark rows. The NAV aggregation is
 done in SQL so the sum is computed where the data lives.
+
+Note on the bond key: the column is named "cusip" for continuity, but the iShares
+holdings file carries no CUSIP, so the value stored is the coupon+maturity
+synthetic identifier (for example "UST_4.250_2034-11-15") built in pcf_loader. A
+US Treasury is uniquely identified by its coupon and maturity, so this is a valid
+unique key, and the schema and the NAV aggregation SQL are unchanged.
 """
 
 from __future__ import annotations
