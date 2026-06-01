@@ -12,3 +12,6 @@ __pycache__/
 # Virtual environments
 venv/
 .venv/
+
+# Manually downloaded holdings baskets (keep the data/ README tracked)
+data/*.csv

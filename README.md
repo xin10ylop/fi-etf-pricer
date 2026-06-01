@@ -103,6 +103,25 @@ tracking difference in basis points. A small number is evidence the engine works
   credit-spread or vendor pricing this tool does not have, and are rejected.
 - End-of-day only. Intraday signals are out of scope, by design (see above).
 
+## PCF basket downloads and bot protection
+
+Issuer holdings CDNs (iShares, Vanguard, State Street) reject requests that do not
+look like a real browser, answering with a 403 Forbidden or an HTML bot-challenge
+page instead of the CSV. Every PCF download therefore sends a centralised set of
+realistic browser headers: a current Chrome-on-macOS User-Agent, the Accept and
+Accept-Language a browser sends, and a Referer pointing at that provider's own
+product or fund page. All three providers use the identical header approach;
+only the Referer host differs. The headers live in one place (`browser_headers`
+in `backend/pcf_loader.py`) so every download path for every provider is
+consistent.
+
+If a download still returns a 403 or an HTML page (for example from a cloud IP
+whose reputation is bot-filtered), the loader detects it and raises a clear error
+naming the provider and ticker rather than trying to parse the HTML. As a fallback
+for any provider, drop a manually downloaded holdings CSV into the `data/` folder
+keyed by ticker (`data/GOVT.csv` or `data/GOVT_holdings.csv`); the loader uses a
+local file in preference to a live fetch. See `data/README.md`.
+
 ## Optional FactSet cross-check
 
 A FactSet Fixed Income Prices cross-check is available purely so the dashboard can

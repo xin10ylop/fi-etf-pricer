@@ -17,6 +17,7 @@ import io
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -25,6 +26,69 @@ from rich.console import Console
 from . import etf_config
 
 console = Console()
+
+# Local holdings fallback. If a CSV for a ticker is present here it is used in
+# preference to a live fetch, so a manually downloaded basket keeps the tool
+# working when a provider CDN blocks this host. Files are keyed by ticker, e.g.
+# data/GOVT.csv or data/GOVT_holdings.csv.
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
+
+class PCFDownloadError(Exception):
+    """Raised when a PCF download is blocked or returns HTML instead of CSV.
+
+    Carries the provider and ticker so the failure is unambiguous regardless of
+    which issuer's CDN did the blocking.
+    """
+
+
+# Realistic browser headers, centralised so every PCF download path for every
+# provider sends the same convincing request. Provider CDNs (Akamai and similar)
+# reject requests that do not look like a real browser, returning 403 Forbidden
+# or an HTML bot-challenge page. A current Chrome-on-macOS User-Agent plus the
+# usual Accept, Accept-Language, and a same-site Referer make the request look
+# like a normal browser navigation from the provider's own site.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+# Per-provider Referer pointing at that provider's own product or fund page, so
+# the download looks like it was initiated from the issuer's site. All three
+# providers use the identical header approach; only the Referer host differs.
+PROVIDER_REFERERS: dict[str, str] = {
+    "ishares": "https://www.ishares.com/us/products/etf-investments",
+    "vanguard": "https://investor.vanguard.com/investment-products/etfs/profile",
+    "ssga": "https://www.ssga.com/us/en/intermediary/etfs/fund-finder",
+}
+
+
+def browser_headers(provider: str, referer: str | None = None) -> dict[str, str]:
+    """Return realistic browser headers for a provider PCF download.
+
+    Centralised so iShares, Vanguard, and State Street (SSGA) all send the same
+    convincing browser fingerprint. Includes a current Chrome-on-macOS
+    User-Agent, an Accept and Accept-Language a browser would send, and a Referer
+    set to the provider's own product or fund page (overridable per request, for
+    example with a specific iShares product page). The Sec-Fetch hints mirror what
+    Chrome sends on a same-site download navigation.
+    """
+    return {
+        "User-Agent": BROWSER_USER_AGENT,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "text/csv,application/csv,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Referer": referer or PROVIDER_REFERERS.get(provider, ""),
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+    }
+
 
 # iShares serves holdings CSVs from product pages following this pattern. The
 # numeric id and slug identify the specific fund; they come from the routing
@@ -70,17 +134,77 @@ class ParsedPCF:
     dropped: list[str] = field(default_factory=list)
 
 
-def _retry_download(url: str, what: str) -> str:
-    """Download a URL as text with the shared retry policy."""
+def _provider_referer(provider: str, ticker: str) -> str:
+    """Return the best Referer for a provider download.
+
+    For iShares the specific product page is used when the ticker is known, which
+    is the most convincing same-site Referer. Other providers fall back to their
+    configured fund-finder page.
+    """
+    if provider == "ishares":
+        product = ISHARES_PRODUCTS.get(ticker.upper())
+        if product:
+            return (
+                f"https://www.ishares.com/us/products/{product['product_id']}/"
+                f"{product['slug']}"
+            )
+    return PROVIDER_REFERERS.get(provider, "")
+
+
+def _looks_like_html(text: str) -> bool:
+    """True if a response body is an HTML page rather than CSV.
+
+    Provider CDNs answer a blocked request with an HTML bot-challenge or consent
+    page. We sniff the leading bytes for an HTML marker so we never hand megabytes
+    of HTML to the CSV parser.
+    """
+    head = text.lstrip()[:256].lower()
+    return (
+        head.startswith("<!doctype html")
+        or head.startswith("<html")
+        or head.startswith("<?xml")
+        and "<html" in head
+        or "<title" in head
+    )
+
+
+def _retry_download(url: str, provider: str, ticker: str) -> str:
+    """Download a PCF as text with realistic browser headers and retries.
+
+    The same centralised browser headers are used for every provider (iShares,
+    Vanguard, SSGA); only the Referer host differs. Transient network failures
+    (timeouts, connection errors, 5xx) are retried under the shared policy. A 403
+    Forbidden or an HTML bot-challenge page is a definitive block that retrying
+    will not fix, so it raises a clear PCFDownloadError naming the provider and
+    ticker immediately rather than burning retries or parsing HTML.
+    """
+    headers = browser_headers(provider, _provider_referer(provider, ticker))
+    what = f"PCF download for {ticker} ({provider})"
     last_exc: Exception | None = None
     for attempt in range(1, etf_config.DOWNLOAD_RETRIES + 1):
         try:
-            resp = requests.get(
-                url, timeout=30, headers={"User-Agent": "fi-etf-pricer"}
-            )
+            resp = requests.get(url, timeout=30, headers=headers)
+            if resp.status_code == 403:
+                raise PCFDownloadError(
+                    f"{provider} returned 403 Forbidden for {ticker}. The provider "
+                    f"CDN is blocking this host as a bot. Retry from a server whose "
+                    f"IP is not bot-filtered, or place a manually downloaded CSV at "
+                    f"{DATA_DIR}/{ticker.upper()}.csv."
+                )
             resp.raise_for_status()
-            return resp.text
-        except Exception as exc:  # noqa: BLE001
+            text = resp.text
+            if _looks_like_html(text):
+                raise PCFDownloadError(
+                    f"{provider} returned an HTML bot-challenge page, not CSV, for "
+                    f"{ticker}. The provider CDN is blocking this host. Retry from a "
+                    f"server whose IP is not bot-filtered, or place a manually "
+                    f"downloaded CSV at {DATA_DIR}/{ticker.upper()}.csv."
+                )
+            return text
+        except PCFDownloadError:
+            # A definitive block; retrying will not help, so surface it now.
+            raise
+        except Exception as exc:  # noqa: BLE001 - transient network errors retry
             last_exc = exc
             console.log(
                 f"[yellow]{what} attempt {attempt}/"
@@ -328,28 +452,48 @@ _PARSERS = {
 }
 
 
-def load_pcf(ticker: str, provider: str, pcf_url: str | None = None) -> ParsedPCF:
-    """Download and parse the PCF for a ticker.
+def _local_holdings_path(ticker: str) -> Path | None:
+    """Return a local holdings CSV for a ticker if one is present.
 
-    The iShares CSV carries a few metadata lines before the holdings header, so we
-    locate the header row dynamically. Returns a fully parsed, Treasury-only
-    ParsedPCF with the cash component captured separately.
+    Supports two common names, data/{TICKER}.csv and data/{TICKER}_holdings.csv,
+    so a manually downloaded basket can be dropped in without renaming. Returns
+    None when no local file exists.
     """
-    url = pcf_url or build_pcf_url(ticker, provider)
-    raw_text = _retry_download(url, f"PCF download for {ticker}")
+    ticker = ticker.upper()
+    for name in (f"{ticker}.csv", f"{ticker}_holdings.csv"):
+        candidate = DATA_DIR / name
+        if candidate.exists():
+            return candidate
+    return None
 
-    # Provider CDNs sometimes answer with an HTML bot-protection or consent page
-    # instead of the CSV, especially from cloud IP ranges. Detect that fast and
-    # raise a clear error rather than handing megabytes of HTML to the CSV parser.
-    head = raw_text.lstrip()[:200].lower()
-    if head.startswith("<!doctype html") or head.startswith("<html"):
-        raise ValueError(
-            f"PCF endpoint for {ticker} returned an HTML page, not CSV. The "
-            f"provider CDN is likely blocking this host; retry from a server "
-            f"whose IP is not bot-filtered, or supply the basket via pcf_url."
+
+def load_pcf(ticker: str, provider: str, pcf_url: str | None = None) -> ParsedPCF:
+    """Load and parse the PCF for a ticker, local file first then live fetch.
+
+    A local holdings CSV under data/ (keyed by ticker) is used in preference to a
+    live download, so a manually downloaded basket keeps the tool working for any
+    provider when the live fetch is blocked. Otherwise the basket is fetched live
+    with realistic browser headers. The provider CSV carries a few metadata lines
+    before the holdings header, so we locate the header row dynamically. Returns a
+    fully parsed, Treasury-only ParsedPCF with the cash component captured
+    separately.
+    """
+    local = _local_holdings_path(ticker)
+    if local is not None:
+        console.log(f"Loading local holdings for {ticker} from {local}")
+        raw_text = local.read_text()
+    else:
+        url = pcf_url or build_pcf_url(ticker, provider)
+        raw_text = _retry_download(url, provider, ticker)
+
+    # Defensive double-check. The live path already rejects HTML, but a local file
+    # could also be a saved HTML page rather than the CSV.
+    if _looks_like_html(raw_text):
+        raise PCFDownloadError(
+            f"Holdings source for {ticker} ({provider}) is an HTML page, not CSV."
         )
 
-    # iShares prepends fund metadata above the holdings table. Find the header
+    # The provider prepends fund metadata above the holdings table. Find the header
     # line (the one that contains a recognisable column such as "CUSIP" or
     # "Name") and parse from there.
     lines = raw_text.splitlines()
