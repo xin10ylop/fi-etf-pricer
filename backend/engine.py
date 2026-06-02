@@ -119,6 +119,7 @@ def refresh_basket(
     database.replace_basket(ticker, holdings, db_path)
     database.update_cash_component(ticker, parsed.cash_component, db_path)
     database.update_basket_as_of(ticker, parsed.as_of, db_path)
+    database.update_shares_outstanding(ticker, parsed.shares_outstanding, db_path)
     return parsed.cash_component
 
 
@@ -261,10 +262,21 @@ def reprice(
     basket_dirty_ask = agg["basket_dirty_ask"]
 
     # 4. NAV per share.
+    # The iShares basket lists the whole fund's holdings, so the basket value must
+    # be divided by the fund's shares outstanding, not the creation unit size. The
+    # creation unit size is kept below for the cost and signal calculations only.
     creation_unit_shares = int(
         routing.get("creation_unit_shares") or etf_config.creation_unit_shares(ticker)
     )
-    nav_per_share = (basket_dirty_mid + cash_component) / creation_unit_shares
+    shares_outstanding = routing.get("shares_outstanding")
+    if not shares_outstanding or float(shares_outstanding) <= 0:
+        raise ValueError(
+            f"Cannot compute NAV for {ticker}: shares outstanding is missing or "
+            f"zero. Upload a current iShares basket file, which carries shares "
+            f"outstanding in its metadata."
+        )
+    shares_outstanding = float(shares_outstanding)
+    nav_per_share = (basket_dirty_mid + cash_component) / shares_outstanding
 
     # 5. Premium against the ETF close (contemporaneous, same curve date).
     etf_price = fetch_closing_price_safe(ticker, valuation_date)

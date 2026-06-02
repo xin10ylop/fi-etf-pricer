@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS routing (
     creation_fee REAL,
     category TEXT,
     cash_component REAL DEFAULT 0.0,
-    basket_as_of TEXT
+    basket_as_of TEXT,
+    shares_outstanding REAL
 );
 
 CREATE TABLE IF NOT EXISTS watchlist (
@@ -141,6 +142,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE routing ADD COLUMN cash_component REAL DEFAULT 0.0"
         )
+    if "shares_outstanding" not in existing:
+        conn.execute("ALTER TABLE routing ADD COLUMN shares_outstanding REAL")
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +209,22 @@ def update_basket_as_of(
         conn.execute(
             "UPDATE routing SET basket_as_of = ? WHERE ticker = ?",
             (as_of.isoformat() if as_of else None, ticker.upper()),
+        )
+
+
+def update_shares_outstanding(
+    ticker: str, shares_outstanding: float | None, db_path: str = etf_config.DATABASE_PATH
+) -> None:
+    """Record the fund shares outstanding for a ticker from the latest basket.
+
+    This is the correct NAV denominator for an iShares whole-fund holdings file,
+    where the par values are the entire fund's, not one creation unit's. Stored so
+    the repricing engine divides the basket value by the right share count.
+    """
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE routing SET shares_outstanding = ? WHERE ticker = ?",
+            (shares_outstanding, ticker.upper()),
         )
 
 

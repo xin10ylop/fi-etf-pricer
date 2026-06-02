@@ -132,6 +132,7 @@ class ParsedPCF:
     holdings: pd.DataFrame  # standardised columns
     cash_component: float  # US dollars of cash in one creation unit
     as_of: date | None = None
+    shares_outstanding: float | None = None  # fund shares outstanding from metadata
     raw_row_count: int = 0
     dropped: list[str] = field(default_factory=list)
 
@@ -416,13 +417,18 @@ def parse_ishares_spreadsheetml(raw_text: str) -> ParsedPCF:
     """
     rows = _extract_holdings_rows(raw_text)
 
-    # Extract the "Fund Holdings as of" date from the metadata block.
+    # Extract the "Fund Holdings as of" date and the fund's shares outstanding
+    # from the metadata block. Shares outstanding is the correct NAV denominator
+    # because this file lists the whole fund's holdings, not one creation unit.
     as_of: date | None = None
+    shares_outstanding: float | None = None
     for row in rows:
-        if row and row[0] and "fund holdings as of" in row[0].strip().lower():
-            if len(row) > 1:
-                as_of = _parse_maturity(row[1])
-            break
+        first = row[0].strip().lower() if row and row[0] else ""
+        if "fund holdings as of" in first and len(row) > 1:
+            as_of = _parse_maturity(row[1])
+        elif "shares outstanding" in first and len(row) > 1:
+            value = _to_float(row[1])
+            shares_outstanding = value if value > 0 else None
 
     # Locate the holdings header row by its leading columns.
     header_idx = None
@@ -480,6 +486,7 @@ def parse_ishares_spreadsheetml(raw_text: str) -> ParsedPCF:
         holdings=pd.DataFrame(holdings_rows),
         cash_component=cash_component,
         as_of=as_of,
+        shares_outstanding=shares_outstanding,
         raw_row_count=len(rows),
         dropped=dropped,
     )
