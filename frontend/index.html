@@ -117,6 +117,20 @@
   .detail td, .detail th { font-size: 12px; }
   canvas { margin-top: 8px; max-height: 240px; }
   .loading { color: var(--amber); }
+
+  .basket-line { margin-bottom: 10px; }
+  .dropzone {
+    border: 1px dashed #333;
+    background: #000;
+    padding: 18px 12px;
+    text-align: center;
+    color: var(--dim);
+    cursor: pointer;
+    user-select: none;
+  }
+  .dropzone.drag { border-color: var(--amber); color: var(--fg); background: #161208; }
+  .dropzone .browse { color: var(--amber); text-decoration: underline; }
+  .upload-status { margin-top: 8px; font-size: 12px; min-height: 16px; }
 </style>
 </head>
 <body>
@@ -139,7 +153,7 @@
       <tr>
         <th class="l">Ticker</th><th class="l">Name</th><th class="l">Signal</th>
         <th>Premium</th><th>NAV</th><th>Track</th><th>Price</th>
-        <th>Edge</th><th>Updated</th>
+        <th>Edge</th><th class="l">Basket</th><th>Updated</th>
       </tr>
     </thead>
     <tbody id="watchlistBody"></tbody>
@@ -150,6 +164,18 @@
       <h2 id="detailTitle" class="amber" style="margin:0;font-size:15px;letter-spacing:1px;"></h2>
       <div class="spacer"></div>
       <button id="refreshBtn">Refresh</button>
+    </div>
+    <div class="card" id="cardBasket" style="margin-top:12px;">
+      <h3>Basket</h3>
+      <div class="basket-line" id="basketAsOf"><span class="dim">No basket loaded</span></div>
+      <div class="basket-line">
+        <a id="downloadLink" href="https://www.ishares.com" target="_blank" rel="noopener" class="amber">Download official holdings</a>
+      </div>
+      <div id="dropZone" class="dropzone">
+        Drag a holdings file here, or <span class="browse">click to browse</span>
+        <input type="file" id="fileInput" accept=".xls,.csv,.xml" style="display:none" />
+      </div>
+      <div id="uploadStatus" class="upload-status"></div>
     </div>
     <div class="cards" style="margin-top:12px;">
       <div class="card" id="cardSummary"><h3>ETF Summary</h3><div id="summaryBody"></div></div>
@@ -183,6 +209,24 @@ const API_BASE = window.API_BASE || "";
 
 let selectedTicker = null;
 let historyChart = null;
+// Latest watchlist rows keyed by ticker, so the detail panel can show the basket
+// as-of date and other row data even before any repricing has run.
+let watchlistByTicker = {};
+
+// Official iShares product pages, used for the "Download official holdings" link.
+const ISHARES_PRODUCT_URLS = {
+  GOVT: "https://www.ishares.com/us/products/239468",
+  IEF: "https://www.ishares.com/us/products/239456",
+  IEI: "https://www.ishares.com/us/products/239455",
+  SHY: "https://www.ishares.com/us/products/239452",
+  TLT: "https://www.ishares.com/us/products/239454",
+};
+function downloadUrl(ticker) {
+  return ISHARES_PRODUCT_URLS[ticker] || "https://www.ishares.com";
+}
+function basketAsOfText(asOf) {
+  return asOf ? "Basket as of " + asOf : "No basket loaded";
+}
 
 function fmt(v, digits = 2) {
   if (v === null || v === undefined || isNaN(v)) return "--";
@@ -231,7 +275,9 @@ async function loadWatchlist(silent) {
 function renderWatchlist(rows) {
   const body = document.getElementById("watchlistBody");
   body.innerHTML = "";
+  watchlistByTicker = {};
   rows.forEach((r) => {
+    watchlistByTicker[r.ticker] = r;
     const tr = document.createElement("tr");
     if (r.ticker === selectedTicker) tr.className = "selected";
     tr.innerHTML = `
@@ -243,10 +289,15 @@ function renderWatchlist(rows) {
       <td class="${trackClass(r.nav_tracking_bps)}">${fmt(r.nav_tracking_bps, 1)}</td>
       <td>${fmt(r.etf_price, 2)}</td>
       <td>${fmtUsd(r.net_edge_usd)}</td>
+      <td class="l dim">${basketAsOfText(r.basket_as_of)}</td>
       <td class="dim">${shortTime(r.last_updated)}</td>`;
     tr.onclick = () => selectTicker(r.ticker);
     body.appendChild(tr);
   });
+  // Keep the open detail panel's basket card in sync with refreshed data.
+  if (selectedTicker && watchlistByTicker[selectedTicker]) {
+    renderBasketCard(selectedTicker);
+  }
 }
 
 // ---- Detail panel ----
@@ -254,8 +305,21 @@ async function selectTicker(ticker) {
   selectedTicker = ticker;
   document.getElementById("detail").style.display = "block";
   document.getElementById("detailTitle").textContent = ticker;
+  document.getElementById("uploadStatus").textContent = "";
+  renderBasketCard(ticker);
   await loadDetail(ticker);
   loadWatchlist(true);
+}
+
+// Render the basket card (download link + as-of) from watchlist data, so it works
+// even before any repricing has produced a signal.
+function renderBasketCard(ticker) {
+  const row = watchlistByTicker[ticker] || {};
+  const link = document.getElementById("downloadLink");
+  link.href = downloadUrl(ticker);
+  document.getElementById("basketAsOf").innerHTML = row.basket_as_of
+    ? `<span class="ok">${basketAsOfText(row.basket_as_of)}</span>`
+    : `<span class="dim">No basket loaded</span>`;
 }
 
 async function loadDetail(ticker) {
@@ -263,8 +327,11 @@ async function loadDetail(ticker) {
     const d = await api("/api/signals/" + ticker);
     renderDetail(d);
   } catch (e) {
+    const asOf = (watchlistByTicker[ticker] || {}).basket_as_of;
     document.getElementById("summaryBody").innerHTML =
-      `<div class="err">${e.message}. Run a repricing first.</div>`;
+      kv("Ticker", ticker, "amber") +
+      kv("Basket", basketAsOfText(asOf), asOf ? "ok" : "dim") +
+      `<div class="err">${e.message}. Upload a basket and run a repricing.</div>`;
     document.getElementById("navBody").innerHTML = "";
     document.getElementById("costBody").innerHTML = "";
     document.getElementById("holdingsBody").innerHTML = "";
@@ -280,9 +347,11 @@ function renderDetail(d) {
   document.getElementById("summaryBody").innerHTML =
     kv("Ticker", s.ticker, "amber") +
     kv("Name", s.name || "--", "dim") +
+    kv("Basket", basketAsOfText(s.basket_as_of), s.basket_as_of ? "ok" : "dim") +
     kv("Curve date", s.curve_date || "--") +
     kv("Last updated", shortTime(s.last_updated)) +
     kv("Pricing source", s.source);
+  renderBasketCard(s.ticker);
 
   document.getElementById("navBody").innerHTML =
     kv("NAV per share", fmt(s.nav_per_share, 4)) +
@@ -413,6 +482,63 @@ document.getElementById("refreshBtn").onclick = async (e) => {
     e.target.textContent = "Refresh";
   }
 };
+
+// ---- Basket upload (drag-and-drop + click-to-browse) ----
+function setUploadStatus(msg, cls) {
+  const el = document.getElementById("uploadStatus");
+  el.textContent = msg;
+  el.className = "upload-status " + (cls || "");
+}
+
+async function uploadBasket(file) {
+  if (!selectedTicker) {
+    setUploadStatus("Select an ETF first.", "err");
+    return;
+  }
+  if (!file) return;
+  setUploadStatus(`Uploading ${file.name} for ${selectedTicker}...`, "dim");
+  const form = new FormData();
+  form.append("file", file);
+  try {
+    const d = await api(
+      "/api/upload-basket?ticker=" + encodeURIComponent(selectedTicker),
+      { method: "POST", body: form }
+    );
+    setUploadStatus(
+      `Loaded ${d.holdings} holdings, ${basketAsOfText(d.basket_as_of)}. ` +
+        `Click REFRESH to reprice.`,
+      "ok"
+    );
+    await loadWatchlist(true);
+    renderBasketCard(selectedTicker);
+  } catch (err) {
+    setUploadStatus("Upload failed: " + err.message, "err");
+  }
+}
+
+const dropZone = document.getElementById("dropZone");
+const fileInput = document.getElementById("fileInput");
+dropZone.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", (e) => {
+  if (e.target.files && e.target.files[0]) uploadBasket(e.target.files[0]);
+  e.target.value = "";
+});
+["dragenter", "dragover"].forEach((ev) =>
+  dropZone.addEventListener(ev, (e) => {
+    e.preventDefault();
+    dropZone.classList.add("drag");
+  })
+);
+["dragleave", "drop"].forEach((ev) =>
+  dropZone.addEventListener(ev, (e) => {
+    e.preventDefault();
+    dropZone.classList.remove("drag");
+  })
+);
+dropZone.addEventListener("drop", (e) => {
+  const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (file) uploadBasket(file);
+});
 
 // ---- Boot + 60s silent auto-refresh ----
 loadWatchlist();

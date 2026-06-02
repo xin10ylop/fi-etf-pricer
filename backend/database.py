@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS routing (
     creation_unit_shares INTEGER,
     creation_fee REAL,
     category TEXT,
-    cash_component REAL DEFAULT 0.0
+    cash_component REAL DEFAULT 0.0,
+    basket_as_of TEXT
 );
 
 CREATE TABLE IF NOT EXISTS watchlist (
@@ -120,10 +121,26 @@ def connect(db_path: str = etf_config.DATABASE_PATH):
 
 
 def init_db(db_path: str = etf_config.DATABASE_PATH) -> None:
-    """Create all tables if they do not exist and seed the default watchlist."""
+    """Create all tables if they do not exist and run lightweight migrations."""
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     console.log("Database schema ready")
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after a database was first created.
+
+    CREATE TABLE IF NOT EXISTS never alters an existing table, so a database made
+    before basket_as_of existed would lack that column. We add it idempotently.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(routing)")}
+    if "basket_as_of" not in existing:
+        conn.execute("ALTER TABLE routing ADD COLUMN basket_as_of TEXT")
+    if "cash_component" not in existing:
+        conn.execute(
+            "ALTER TABLE routing ADD COLUMN cash_component REAL DEFAULT 0.0"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +190,22 @@ def update_cash_component(
         conn.execute(
             "UPDATE routing SET cash_component = ? WHERE ticker = ?",
             (cash_component, ticker.upper()),
+        )
+
+
+def update_basket_as_of(
+    ticker: str, as_of: date | None, db_path: str = etf_config.DATABASE_PATH
+) -> None:
+    """Record the basket as-of date for a ticker from the latest holdings file.
+
+    The as-of date is the "Fund Holdings as of" date published in the basket file.
+    Storing it lets the dashboard show how fresh the holdings are. None clears it,
+    which surfaces as "No basket loaded" in the UI.
+    """
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE routing SET basket_as_of = ? WHERE ticker = ?",
+            (as_of.isoformat() if as_of else None, ticker.upper()),
         )
 
 

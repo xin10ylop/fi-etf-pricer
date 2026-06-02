@@ -13,3 +13,4 @@ python-dateutil>=2.9
 schedule>=1.2
 rich>=13.7
 pydantic>=2.6
+python-multipart>=0.0.9

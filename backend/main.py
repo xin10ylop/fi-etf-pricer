@@ -19,14 +19,14 @@ from datetime import date, datetime
 from pathlib import Path
 
 import schedule
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from rich.console import Console
 
 from . import database, etf_config
-from .engine import refresh_basket, reprice
+from .engine import refresh_basket, reprice, save_uploaded_basket
 from .etf_discovery import (
     NotATreasuryETF,
     UnknownProvider,
@@ -214,6 +214,7 @@ def api_watchlist() -> dict:
                 "nav_tracking_bps": sig["nav_tracking_bps"] if sig else None,
                 "net_edge_usd": sig["net_edge_usd"] if sig else None,
                 "last_updated": sig["valuation_ts"] if sig else None,
+                "basket_as_of": routing.get("basket_as_of"),
             }
         )
     return {"watchlist": summary}
@@ -266,6 +267,7 @@ def api_signal_detail(ticker: str) -> dict:
             "name": routing.get("name"),
             "curve_date": sig["curve_date"],
             "last_updated": sig["valuation_ts"],
+            "basket_as_of": routing.get("basket_as_of"),
             "source": "curve",
             "nav_per_share": sig["nav_per_share"],
             "official_nav": sig["official_nav"],
@@ -288,6 +290,25 @@ def api_signal_detail(ticker: str) -> dict:
 # ---------------------------------------------------------------------------
 # Repricing triggers
 # ---------------------------------------------------------------------------
+
+
+@app.post("/api/upload-basket")
+async def api_upload_basket(ticker: str, file: UploadFile = File(...)) -> dict:
+    """Accept a manually uploaded holdings file and load it as the basket.
+
+    The file (an iShares SpreadsheetML .xls or a provider CSV) is posted as
+    multipart form data with the ticker as a query parameter. It is persisted and
+    parsed into the basket, and the basket as-of date is recorded. The user is
+    then prompted to refresh (reprice). Returns the holding count and as-of date.
+    """
+    content = await file.read()
+    try:
+        result = save_uploaded_basket(ticker, content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Basket upload failed: {exc}")
+    return {**result, "status": "uploaded"}
 
 
 @app.post("/api/run")

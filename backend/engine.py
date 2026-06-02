@@ -27,7 +27,7 @@ from rich.console import Console
 from . import database, etf_config
 from .curve import TreasuryCurve, build_curve
 from .etf_discovery import fetch_closing_price, fetch_official_nav
-from .pcf_loader import load_pcf
+from .pcf_loader import DATA_DIR, load_pcf
 from .pricing import Bond
 from .price_provider import CurvePriceProvider, PriceProvider
 
@@ -118,7 +118,64 @@ def refresh_basket(
         )
     database.replace_basket(ticker, holdings, db_path)
     database.update_cash_component(ticker, parsed.cash_component, db_path)
+    database.update_basket_as_of(ticker, parsed.as_of, db_path)
     return parsed.cash_component
+
+
+def save_uploaded_basket(
+    ticker: str, content: bytes, db_path: str = etf_config.DATABASE_PATH
+) -> dict:
+    """Persist a manually uploaded holdings file and load it into the basket.
+
+    The uploaded bytes are written into the data/ folder under the ticker, where
+    the loader looks first, so every later repricing uses the manual basket until
+    it is replaced. The format (SpreadsheetML .xls or CSV) is detected from the
+    content, not the file name, then refresh_basket parses and stores it. Returns
+    the holding count and the basket as-of date.
+    """
+    routing = database.get_routing(ticker, db_path)
+    if routing is None:
+        # Default watchlist tickers are seeded without a routing row (routing is
+        # otherwise created on discovery). A manual upload supplies the basket
+        # directly, so we create a minimal routing row for any watchlisted ticker.
+        if ticker.upper() not in database.get_watchlist(db_path):
+            raise ValueError(
+                f"{ticker} is not on the watchlist; add it before uploading a basket."
+            )
+        database.upsert_routing(
+            ticker=ticker.upper(),
+            name=ticker.upper(),
+            provider="ishares",
+            pcf_url="",
+            creation_unit_shares=etf_config.creation_unit_shares(ticker),
+            creation_fee=etf_config.creation_fee(ticker),
+            category="Treasury",
+            db_path=db_path,
+        )
+
+    text_head = content[:512].decode("utf-8", errors="replace").lstrip().lower()
+    if "<html" in text_head or text_head.startswith("<!doctype html"):
+        raise ValueError("Uploaded file is an HTML page, not a holdings export.")
+    # Choose a filename the loader recognises; the parser routes by content.
+    is_spreadsheetml = (
+        "<ss:workbook" in text_head
+        or "urn:schemas-microsoft-com:office:spreadsheet" in text_head
+    )
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Remove any prior local file for this ticker so the new upload wins cleanly.
+    for existing in DATA_DIR.glob(f"{ticker.upper()}.*"):
+        existing.unlink()
+    target = DATA_DIR / (f"{ticker.upper()}.xls" if is_spreadsheetml else f"{ticker.upper()}.csv")
+    target.write_bytes(content)
+
+    cash = refresh_basket(ticker, db_path)
+    routing = database.get_routing(ticker, db_path) or {}
+    return {
+        "ticker": ticker.upper(),
+        "holdings": len(database.get_basket(ticker, db_path)),
+        "cash_component": cash,
+        "basket_as_of": routing.get("basket_as_of"),
+    }
 
 
 def compute_signal(
