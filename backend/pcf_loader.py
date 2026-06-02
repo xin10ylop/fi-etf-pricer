@@ -130,11 +130,15 @@ class ParsedPCF:
     """A parsed basket: priceable Treasury holdings plus the cash component."""
 
     holdings: pd.DataFrame  # standardised columns
-    cash_component: float  # US dollars of cash in one creation unit
+    cash_component: float  # US dollars: NET of every non-Treasury holdings row
     as_of: date | None = None
     shares_outstanding: float | None = None  # fund shares outstanding from metadata
+    vendor_mv_total: float = 0.0  # SUM of file Market Value over ALL holdings rows
+    official_nav: float | None = None  # published NAV for the as-of date (file)
+    official_nav_date: date | None = None  # date of the published NAV used
     raw_row_count: int = 0
     dropped: list[str] = field(default_factory=list)
+    cash_lines: list[str] = field(default_factory=list)
 
 
 def _provider_referer(provider: str, ticker: str) -> str:
@@ -388,6 +392,64 @@ def _regex_extract_rows(block: str) -> list[list[str]]:
     return rows
 
 
+def _parse_nav_history(raw_text: str) -> dict[date, float]:
+    """Parse the file's NAV-history table from the "Historical" worksheet.
+
+    iShares ships a Historical worksheet with columns
+    "As Of | NAV per Share | Ex-Dividends | Shares Outstanding". We return a map
+    of date to published NAV per share, used to read the official NAV for the
+    basket as-of date so the comparison is contemporaneous and vendor-sourced
+    rather than a live Yahoo number.
+    """
+    match = re.search(
+        r'<ss:Worksheet ss:Name="Historical">.*?</ss:Worksheet>', raw_text, re.S
+    )
+    if not match:
+        return {}
+    wrapped = (
+        '<ss:Workbook xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">'
+        + match.group(0)
+        + "</ss:Workbook>"
+    )
+    try:
+        root = ET.fromstring(wrapped)
+        rows = [_row_values(r) for r in root.iter(f"{SS_NS}Row")]
+    except ET.ParseError:
+        rows = _regex_extract_rows(match.group(0))
+
+    history: dict[date, float] = {}
+    for row in rows:
+        if len(row) < 2:
+            continue
+        d = _parse_maturity(row[0])
+        if d is None:  # header rows and blanks have no parseable date
+            continue
+        try:
+            nav = _to_float(row[1])
+        except ValueError:
+            continue
+        if nav > 0:
+            history[d] = nav
+    return history
+
+
+def official_nav_for(history: dict[date, float], as_of: date | None) -> tuple[float | None, date | None]:
+    """Return the published NAV on or before the as-of date, with its date.
+
+    Picks the exact as-of row when present, otherwise the most recent NAV on or
+    before it. Returns (None, None) when no history is available.
+    """
+    if not history or as_of is None:
+        return None, None
+    if as_of in history:
+        return history[as_of], as_of
+    earlier = [d for d in history if d <= as_of]
+    if not earlier:
+        return None, None
+    best = max(earlier)
+    return history[best], best
+
+
 def parse_ishares_spreadsheetml(raw_text: str) -> ParsedPCF:
     """Parse the real iShares SpreadsheetML holdings file into the basket shape.
 
@@ -449,7 +511,8 @@ def parse_ishares_spreadsheetml(raw_text: str) -> ParsedPCF:
 
     holdings_rows = []
     cash_component = 0.0
-    dropped: list[str] = []
+    cash_lines: list[str] = []
+    vendor_mv_total = 0.0  # sum of file Market Value over ALL holdings rows
 
     for row in rows[header_idx + 1 :]:
         if not any(c.strip() for c in row):
@@ -457,8 +520,10 @@ def parse_ishares_spreadsheetml(raw_text: str) -> ParsedPCF:
         asset_class = cell(row, "Asset Class")
         sector = cell(row, "Sector")
         name = cell(row, "Name")
-        # Keep only genuine Treasury holdings.
+        market_value = _to_float(cell(row, "Market Value"))
+        vendor_mv_total += market_value
         if asset_class == "Fixed Income" and sector == "Treasuries":
+            # A priceable Treasury: keep it for curve pricing.
             maturity = _parse_maturity(cell(row, "Maturity"))
             coupon = _to_float(cell(row, "Coupon (%)")) / 100.0
             holdings_rows.append(
@@ -468,27 +533,39 @@ def parse_ishares_spreadsheetml(raw_text: str) -> ParsedPCF:
                     "name": name,
                     "par_value": _to_float(cell(row, "Par Value")),
                     "weight": _to_float(cell(row, "Weight (%)")),
-                    "price": _to_float(cell(row, "Price")),
+                    "price": _to_float(cell(row, "Price")),  # vendor clean price
+                    "vendor_market_value": market_value,  # vendor dirty value
                     "maturity": maturity,
                     "coupon": coupon,
                 }
             )
-        elif "cash" in asset_class.lower() or "cash" in name.lower():
-            # A cash row flows straight into the cash component.
-            cash_component += _to_float(cell(row, "Market Value"))
         else:
-            dropped.append(name)
+            # Every NON-Treasury row (money market, cash, derivatives) is a
+            # cash-equivalent and flows into the cash component at its file Market
+            # Value, preserving sign. We never pick a single row: securities
+            # lending collateral and the USD cash line must both be summed.
+            cash_component += market_value
+            cash_lines.append(f"{name} [{asset_class}] {market_value:,.2f}")
 
-    if cash_component == 0.0:
-        console.log("No cash row found in iShares basket; cash component defaults to 0")
+    history = _parse_nav_history(raw_text)
+    official_nav, official_nav_date = official_nav_for(history, as_of)
+
+    console.log(
+        f"Cash component (net of {len(cash_lines)} non-Treasury rows): "
+        f"{cash_component:,.2f}"
+    )
 
     return ParsedPCF(
         holdings=pd.DataFrame(holdings_rows),
         cash_component=cash_component,
         as_of=as_of,
         shares_outstanding=shares_outstanding,
+        vendor_mv_total=vendor_mv_total,
+        official_nav=official_nav,
+        official_nav_date=official_nav_date,
         raw_row_count=len(rows),
-        dropped=dropped,
+        dropped=[],
+        cash_lines=cash_lines,
     )
 
 

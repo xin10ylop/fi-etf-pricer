@@ -116,6 +116,18 @@
   .detail td, .detail th { font-size: 12px; }
   .loading { color: var(--amber); }
 
+  .bridge { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .bridge .node {
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+    background: #000;
+    text-align: center;
+  }
+  .bridge .node .lbl { color: var(--dim); font-size: 11px; }
+  .bridge .node .val { color: var(--fg); }
+  .bridge .arrow { color: var(--amber); font-size: 11px; text-align: center; }
+  .bridge .arrow .b { display: block; }
+
   .basket-line { margin-bottom: 10px; }
   .dropzone {
     border: 1px dashed #333;
@@ -177,12 +189,19 @@
       <div class="card" id="cardNav"><h3>NAV and Pricing</h3><div id="navBody"></div></div>
       <div class="card" id="cardCost"><h3>Cost Breakdown</h3><div id="costBody"></div></div>
     </div>
+    <div class="card" id="cardBridge" style="margin-top:12px;">
+      <h3>NAV Bridge</h3>
+      <div id="bridgeBody" class="bridge"></div>
+      <div id="reconBody" style="margin-top:10px;"></div>
+    </div>
     <div class="card" style="margin-top:12px;">
       <h3>Top 10 Holdings</h3>
+      <div id="reconSummary" class="dim" style="margin-bottom:8px;"></div>
       <table>
         <thead><tr>
           <th class="l">Name</th><th class="l">ID</th><th>Coupon</th>
           <th>Maturity</th><th>Clean</th><th>Accrued</th><th>Dirty</th>
+          <th>Vendor</th><th>vs vendor (bps)</th>
         </tr></thead>
         <tbody id="holdingsBody"></tbody>
       </table>
@@ -335,29 +354,54 @@ function kv(label, value, cls) {
 }
 
 function renderDetail(d) {
-  const s = d.summary, c = d.costs;
+  const s = d.summary, c = d.costs, br = d.bridge || {}, rc = d.reconciliation || {};
   document.getElementById("summaryBody").innerHTML =
     kv("Ticker", s.ticker, "amber") +
     kv("Name", s.name || "--", "dim") +
-    kv("Basket", basketAsOfText(s.basket_as_of), s.basket_as_of ? "ok" : "dim") +
+    kv("Basket as of", s.basket_as_of || "--", s.basket_as_of ? "ok" : "dim") +
     kv("Curve date", s.curve_date || "--") +
-    kv("Last updated", shortTime(s.last_updated)) +
+    kv("ETF price date", s.etf_price_date || "--") +
+    kv("Official NAV date", s.official_nav_date || "--") +
     kv("Pricing source", s.source);
   renderBasketCard(s.ticker);
 
+  const premCurve = s.premium_vs_curve_bps != null ? s.premium_vs_curve_bps : s.premium_bps;
   document.getElementById("navBody").innerHTML =
-    kv("NAV per share", fmt(s.nav_per_share, 4)) +
+    kv("Curve NAV", fmt(s.curve_nav != null ? s.curve_nav : s.nav_per_share, 4)) +
     kv("Official NAV", fmt(s.official_nav, 4)) +
     kv("Tracking (bps)", fmt(s.nav_tracking_bps, 1), trackClass(s.nav_tracking_bps)) +
     kv("ETF price", fmt(s.etf_price, 2)) +
-    kv("Premium (bps)", fmt(s.premium_bps, 1), premClass(s.premium_bps)) +
+    kv("Premium vs curve (bps)", fmt(premCurve, 1), premClass(premCurve)) +
+    kv("Premium vs official (bps)", fmt(s.premium_vs_official_bps, 1), premClass(s.premium_vs_official_bps)) +
     kv("Net edge", fmtUsd(s.net_edge_usd), premClass(s.net_edge_usd)) +
     `<div class="badge ${signalClass(s.signal)}">${s.signal || "--"}</div>`;
 
   document.getElementById("costBody").innerHTML =
     kv("Creation fee", fmtUsd(c.creation_fee)) +
     kv("Bond half-spread", fmtUsd(c.bond_spread_cost)) +
-    kv("Breakeven (bps)", fmt(c.breakeven_bps, 2), "amber");
+    kv("Breakeven (bps)", fmt(c.breakeven_bps, 2), "amber") +
+    kv("Confidence band (bps)", fmt(c.confidence_band_bps, 2), "dim") +
+    kv("Effective threshold (bps)", fmt(c.effective_threshold, 2), "amber");
+
+  // NAV bridge: Official -> +timing -> Vendor -> +curve_vs_vendor -> Curve.
+  const node = (lbl, val) => `<div class="node"><div class="lbl">${lbl}</div><div class="val">${val}</div></div>`;
+  const arrow = (bps) => `<div class="arrow"><span class="b ${premClass(bps)}">${bps>=0?"+":""}${fmt(bps,1)} bps</span>&#8594;</div>`;
+  document.getElementById("bridgeBody").innerHTML =
+    node("Official NAV", fmt(br.official_nav, 4)) +
+    arrow(br.vendor_timing_bps || 0) +
+    node("Vendor NAV", fmt(br.vendor_nav, 4)) +
+    arrow(br.curve_vs_vendor_bps || 0) +
+    node("Curve NAV", fmt(br.curve_nav, 4));
+  document.getElementById("reconBody").innerHTML =
+    kv("Treasury dirty value", fmtUsd(rc.treasury_dirty_value)) +
+    kv("Cash component", fmtUsd(rc.cash_component)) +
+    kv("Shares outstanding", rc.shares_outstanding != null ? Number(rc.shares_outstanding).toLocaleString() : "--") +
+    kv("Tracking (bps)", fmt(rc.nav_tracking_bps, 2), trackClass(rc.nav_tracking_bps));
+
+  const summ = (rc.mean_abs_diff_bps != null)
+    ? `Curve vs vendor per-bond: mean |diff| ${fmt(rc.mean_abs_diff_bps,1)} bps, max ${fmt(rc.max_abs_diff_bps,1)} bps`
+    : "";
+  document.getElementById("reconSummary").textContent = summ;
 
   const hb = document.getElementById("holdingsBody");
   hb.innerHTML = "";
@@ -370,7 +414,9 @@ function renderDetail(d) {
       <td>${h.maturity || "--"}</td>
       <td>${fmt(h.clean_mid, 4)}</td>
       <td>${fmt(h.accrued_interest, 4)}</td>
-      <td>${fmt(h.dirty_mid, 4)}</td>`;
+      <td>${fmt(h.dirty_mid, 4)}</td>
+      <td>${fmt(h.vendor_price, 4)}</td>
+      <td class="${premClass(h.diff_bps)}">${fmt(h.diff_bps, 1)}</td>`;
     hb.appendChild(tr);
   });
 }

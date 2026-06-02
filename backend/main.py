@@ -242,6 +242,14 @@ def api_signal_detail(ticker: str) -> dict:
 
     curve_date = date.fromisoformat(sig["curve_date"])
     marks = database.latest_marks(ticker, curve_date)
+
+    def diff_bps(m: dict) -> float | None:
+        """Per-bond reconciliation: curve clean vs the file vendor clean price."""
+        vp = m.get("vendor_price")
+        if vp and m.get("clean_mid"):
+            return (m["clean_mid"] / vp - 1.0) * 10000.0
+        return None
+
     top_holdings = [
         {
             "name": m.get("name"),
@@ -252,12 +260,17 @@ def api_signal_detail(ticker: str) -> dict:
             "clean_mid": m["clean_mid"],
             "accrued_interest": m["accrued_interest"],
             "dirty_mid": m["dirty_mid"],
+            "vendor_price": m.get("vendor_price"),
+            "diff_bps": diff_bps(m),
         }
         for m in marks[:10]
     ]
 
     history = [
-        {"curve_date": h["curve_date"], "premium_bps": h["premium_bps"]}
+        {
+            "curve_date": h["curve_date"],
+            "premium_bps": h.get("premium_vs_curve_bps") or h["premium_bps"],
+        }
         for h in database.signal_history(ticker, days=30)
     ]
 
@@ -267,13 +280,20 @@ def api_signal_detail(ticker: str) -> dict:
             "name": routing.get("name"),
             "curve_date": sig["curve_date"],
             "last_updated": sig["valuation_ts"],
-            "basket_as_of": routing.get("basket_as_of"),
+            "basket_as_of": sig.get("basket_as_of") or routing.get("basket_as_of"),
+            "etf_price_date": sig.get("etf_price_date"),
+            "official_nav_date": sig.get("official_nav_date"),
             "source": "curve",
             "nav_per_share": sig["nav_per_share"],
+            "curve_nav": sig.get("curve_nav"),
             "official_nav": sig["official_nav"],
             "nav_tracking_bps": sig["nav_tracking_bps"],
             "etf_price": sig["etf_price"],
             "premium_bps": sig["premium_bps"],
+            "premium_vs_curve_bps": sig.get("premium_vs_curve_bps"),
+            "premium_vs_official_bps": sig.get("premium_vs_official_bps"),
+            "confidence_band_bps": sig.get("confidence_band_bps"),
+            "effective_threshold": sig.get("effective_threshold"),
             "signal": sig["signal"],
             "net_edge_usd": sig["net_edge_usd"],
         },
@@ -281,6 +301,25 @@ def api_signal_detail(ticker: str) -> dict:
             "creation_fee": sig["creation_fee"],
             "bond_spread_cost": sig["bond_spread_cost"],
             "breakeven_bps": sig["breakeven_bps"],
+            "confidence_band_bps": sig.get("confidence_band_bps"),
+            "effective_threshold": sig.get("effective_threshold"),
+        },
+        "bridge": {
+            "official_nav": sig["official_nav"],
+            "vendor_timing_bps": sig.get("vendor_timing_bps"),
+            "vendor_nav": sig.get("vendor_nav"),
+            "curve_vs_vendor_bps": sig.get("curve_vs_vendor_bps"),
+            "curve_nav": sig.get("curve_nav"),
+        },
+        "reconciliation": {
+            "treasury_dirty_value": sig.get("treasury_dirty_value"),
+            "cash_component": sig.get("cash_component"),
+            "shares_outstanding": sig.get("shares_outstanding"),
+            "curve_nav": sig.get("curve_nav"),
+            "official_nav": sig["official_nav"],
+            "nav_tracking_bps": sig["nav_tracking_bps"],
+            "mean_abs_diff_bps": sig.get("mean_abs_diff_bps"),
+            "max_abs_diff_bps": sig.get("max_abs_diff_bps"),
         },
         "top_holdings": top_holdings,
         "history": history,
@@ -351,6 +390,17 @@ def _result_to_dict(result) -> dict:
         "total_costs": result.total_costs,
         "basket_dirty_mid": result.basket_dirty_mid,
         "cash_component": result.cash_component,
+        "curve_nav": result.curve_nav,
+        "vendor_nav": result.vendor_nav,
+        "vendor_timing_bps": result.vendor_timing_bps,
+        "curve_vs_vendor_bps": result.curve_vs_vendor_bps,
+        "premium_vs_curve_bps": result.premium_vs_curve_bps,
+        "premium_vs_official_bps": result.premium_vs_official_bps,
+        "confidence_band_bps": result.confidence_band_bps,
+        "effective_threshold": result.effective_threshold,
+        "basket_as_of": result.basket_as_of,
+        "mean_abs_diff_bps": result.mean_abs_diff_bps,
+        "max_abs_diff_bps": result.max_abs_diff_bps,
     }
 
 

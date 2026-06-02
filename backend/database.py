@@ -40,7 +40,10 @@ CREATE TABLE IF NOT EXISTS routing (
     category TEXT,
     cash_component REAL DEFAULT 0.0,
     basket_as_of TEXT,
-    shares_outstanding REAL
+    shares_outstanding REAL,
+    vendor_mv_total REAL,
+    official_nav REAL,
+    official_nav_date TEXT
 );
 
 CREATE TABLE IF NOT EXISTS watchlist (
@@ -59,6 +62,7 @@ CREATE TABLE IF NOT EXISTS basket_holdings (
     cusip TEXT,
     par_value REAL,
     weight REAL,
+    vendor_price REAL,
     PRIMARY KEY (ticker, cusip)
 );
 
@@ -100,6 +104,22 @@ CREATE TABLE IF NOT EXISTS signals (
     breakeven_bps REAL,
     signal TEXT,
     net_edge_usd REAL,
+    premium_vs_curve_bps REAL,
+    premium_vs_official_bps REAL,
+    curve_nav REAL,
+    vendor_nav REAL,
+    vendor_timing_bps REAL,
+    curve_vs_vendor_bps REAL,
+    confidence_band_bps REAL,
+    effective_threshold REAL,
+    basket_as_of TEXT,
+    etf_price_date TEXT,
+    official_nav_date TEXT,
+    treasury_dirty_value REAL,
+    cash_component REAL,
+    shares_outstanding REAL,
+    mean_abs_diff_bps REAL,
+    max_abs_diff_bps REAL,
     PRIMARY KEY (ticker, curve_date)
 );
 """
@@ -133,17 +153,48 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """Add columns introduced after a database was first created.
 
     CREATE TABLE IF NOT EXISTS never alters an existing table, so a database made
-    before basket_as_of existed would lack that column. We add it idempotently.
+    before a column existed would lack it. We add every newer column idempotently.
     """
-    existing = {row["name"] for row in conn.execute("PRAGMA table_info(routing)")}
-    if "basket_as_of" not in existing:
-        conn.execute("ALTER TABLE routing ADD COLUMN basket_as_of TEXT")
-    if "cash_component" not in existing:
-        conn.execute(
-            "ALTER TABLE routing ADD COLUMN cash_component REAL DEFAULT 0.0"
-        )
-    if "shares_outstanding" not in existing:
-        conn.execute("ALTER TABLE routing ADD COLUMN shares_outstanding REAL")
+
+    def add_missing(table: str, columns: dict[str, str]) -> None:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+    add_missing(
+        "routing",
+        {
+            "basket_as_of": "TEXT",
+            "cash_component": "REAL DEFAULT 0.0",
+            "shares_outstanding": "REAL",
+            "vendor_mv_total": "REAL",
+            "official_nav": "REAL",
+            "official_nav_date": "TEXT",
+        },
+    )
+    add_missing("basket_holdings", {"vendor_price": "REAL"})
+    add_missing(
+        "signals",
+        {
+            "premium_vs_curve_bps": "REAL",
+            "premium_vs_official_bps": "REAL",
+            "curve_nav": "REAL",
+            "vendor_nav": "REAL",
+            "vendor_timing_bps": "REAL",
+            "curve_vs_vendor_bps": "REAL",
+            "confidence_band_bps": "REAL",
+            "effective_threshold": "REAL",
+            "basket_as_of": "TEXT",
+            "etf_price_date": "TEXT",
+            "official_nav_date": "TEXT",
+            "treasury_dirty_value": "REAL",
+            "cash_component": "REAL",
+            "shares_outstanding": "REAL",
+            "mean_abs_diff_bps": "REAL",
+            "max_abs_diff_bps": "REAL",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +279,32 @@ def update_shares_outstanding(
         )
 
 
+def update_vendor_metadata(
+    ticker: str,
+    vendor_mv_total: float | None,
+    official_nav: float | None,
+    official_nav_date: date | None,
+    db_path: str = etf_config.DATABASE_PATH,
+) -> None:
+    """Record vendor totals and the published NAV for a ticker from the file.
+
+    vendor_mv_total is the sum of the file Market Value over all holdings rows
+    (used for the vendor NAV in the NAV bridge); official_nav and its date come
+    from the file's own NAV-history table for the basket as-of date.
+    """
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE routing SET vendor_mv_total = ?, official_nav = ?, "
+            "official_nav_date = ? WHERE ticker = ?",
+            (
+                vendor_mv_total,
+                official_nav,
+                official_nav_date.isoformat() if official_nav_date else None,
+                ticker.upper(),
+            ),
+        )
+
+
 def get_routing(ticker: str, db_path: str = etf_config.DATABASE_PATH) -> dict | None:
     """Return the routing record for a ticker, or None if not present."""
     with connect(db_path) as conn:
@@ -285,15 +362,22 @@ def replace_basket(
     """Replace the stored basket for a ticker with a fresh set of holdings.
 
     The old basket is cleared first so a shrinking basket never leaves stale
-    holdings behind. Each holding carries cusip, par_value, and weight.
+    holdings behind. Each holding carries cusip, par_value, weight, and the
+    vendor clean price from the file (kept for the per-bond reconciliation).
     """
     with connect(db_path) as conn:
         conn.execute("DELETE FROM basket_holdings WHERE ticker = ?", (ticker.upper(),))
         conn.executemany(
             "INSERT OR REPLACE INTO basket_holdings "
-            "(ticker, cusip, par_value, weight) VALUES (?, ?, ?, ?)",
+            "(ticker, cusip, par_value, weight, vendor_price) VALUES (?, ?, ?, ?, ?)",
             [
-                (ticker.upper(), h["cusip"], h["par_value"], h["weight"])
+                (
+                    ticker.upper(),
+                    h["cusip"],
+                    h["par_value"],
+                    h["weight"],
+                    h.get("vendor_price"),
+                )
                 for h in holdings
             ],
         )
@@ -303,7 +387,7 @@ def get_basket(ticker: str, db_path: str = etf_config.DATABASE_PATH) -> list[dic
     """Return the stored basket holdings for a ticker joined with bond data."""
     with connect(db_path) as conn:
         rows = conn.execute(
-            """SELECT h.cusip, h.par_value, h.weight,
+            """SELECT h.cusip, h.par_value, h.weight, h.vendor_price,
                       b.name, b.coupon, b.maturity
                FROM basket_holdings h
                LEFT JOIN bonds b ON b.cusip = h.cusip
@@ -408,29 +492,28 @@ def aggregate_basket_nav(
 
 
 def store_signal(signal: dict, db_path: str = etf_config.DATABASE_PATH) -> None:
-    """Store a computed signal row, one per (ticker, curve_date)."""
+    """Store a computed signal row, one per (ticker, curve_date).
+
+    Missing keys default to None so older callers keep working; the reconciliation
+    and bridge fields are written when the engine supplies them.
+    """
+    columns = [
+        "curve_date", "valuation_ts", "ticker", "etf_price", "nav_per_share",
+        "official_nav", "nav_tracking_bps", "premium_bps", "bond_spread_cost",
+        "creation_fee", "breakeven_bps", "signal", "net_edge_usd",
+        "premium_vs_curve_bps", "premium_vs_official_bps", "curve_nav",
+        "vendor_nav", "vendor_timing_bps", "curve_vs_vendor_bps",
+        "confidence_band_bps", "effective_threshold", "basket_as_of",
+        "etf_price_date", "official_nav_date", "treasury_dirty_value",
+        "cash_component", "shares_outstanding", "mean_abs_diff_bps",
+        "max_abs_diff_bps",
+    ]
+    placeholders = ", ".join("?" for _ in columns)
     with connect(db_path) as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO signals
-               (curve_date, valuation_ts, ticker, etf_price, nav_per_share,
-                official_nav, nav_tracking_bps, premium_bps, bond_spread_cost,
-                creation_fee, breakeven_bps, signal, net_edge_usd)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                signal["curve_date"],
-                signal["valuation_ts"],
-                signal["ticker"],
-                signal["etf_price"],
-                signal["nav_per_share"],
-                signal["official_nav"],
-                signal["nav_tracking_bps"],
-                signal["premium_bps"],
-                signal["bond_spread_cost"],
-                signal["creation_fee"],
-                signal["breakeven_bps"],
-                signal["signal"],
-                signal["net_edge_usd"],
-            ),
+            f"INSERT OR REPLACE INTO signals ({', '.join(columns)}) "
+            f"VALUES ({placeholders})",
+            tuple(signal.get(c) for c in columns),
         )
 
 
@@ -462,7 +545,8 @@ def latest_marks(
     """Return the stored marks for a basket on a curve date, joined with bonds."""
     with connect(db_path) as conn:
         rows = conn.execute(
-            """SELECT m.*, b.name, b.coupon, b.maturity, h.par_value, h.weight
+            """SELECT m.*, b.name, b.coupon, b.maturity,
+                      h.par_value, h.weight, h.vendor_price
                FROM marks m
                JOIN basket_holdings h ON h.cusip = m.cusip AND h.ticker = m.ticker
                LEFT JOIN bonds b ON b.cusip = m.cusip
