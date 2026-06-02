@@ -4,7 +4,6 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>TREASURY ETF PRICER</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
   /* Dark terminal aesthetic: sharp edges, monospace, minimal padding. */
   :root {
@@ -115,7 +114,6 @@
   }
   .detail table { margin-top: 0; }
   .detail td, .detail th { font-size: 12px; }
-  canvas { margin-top: 8px; max-height: 240px; }
   .loading { color: var(--amber); }
 
   .basket-line { margin-bottom: 10px; }
@@ -141,12 +139,9 @@
 
 <div class="wrap">
   <div class="row">
-    <input id="search" placeholder="Search ticker e.g. IEF" autocomplete="off" />
-    <button id="addBtn">Add</button>
     <div class="spacer"></div>
     <button id="runAllBtn">Run All</button>
   </div>
-  <div id="discoverNote" class="discover-note"></div>
 
   <table id="watchlist">
     <thead>
@@ -192,10 +187,6 @@
         <tbody id="holdingsBody"></tbody>
       </table>
     </div>
-    <div class="card" style="margin-top:12px;">
-      <h3>Premium History (30d, bps)</h3>
-      <canvas id="historyChart"></canvas>
-    </div>
   </div>
 </div>
 
@@ -208,18 +199,19 @@
 const API_BASE = window.API_BASE || "";
 
 let selectedTicker = null;
-let historyChart = null;
 // Latest watchlist rows keyed by ticker, so the detail panel can show the basket
 // as-of date and other row data even before any repricing has run.
 let watchlistByTicker = {};
 
 // Official iShares product pages, used for the "Download official holdings" link.
 const ISHARES_PRODUCT_URLS = {
-  GOVT: "https://www.ishares.com/us/products/239468",
-  IEF: "https://www.ishares.com/us/products/239456",
-  IEI: "https://www.ishares.com/us/products/239455",
-  SHY: "https://www.ishares.com/us/products/239452",
-  TLT: "https://www.ishares.com/us/products/239454",
+  GOVT: "https://www.ishares.com/us/products/239468/ishares-us-treasury-bond-etf",
+  IEF: "https://www.ishares.com/us/products/239456/ishares-710-year-treasury-bond-etf",
+  IEI: "https://www.ishares.com/us/products/239455/ishares-37-year-treasury-bond-etf",
+  SHY: "https://www.ishares.com/us/products/239452/ishares-13-year-treasury-bond-etf",
+  TLT: "https://www.ishares.com/us/products/239454/ishares-20-year-treasury-bond-etf",
+  TLH: "https://www.ishares.com/us/products/239453/ishares-1020-year-treasury-bond-etf",
+  SGOV: "https://www.ishares.com/us/products/314116/ishares-0-3-month-treasury-bond-etf",
 };
 function downloadUrl(ticker) {
   return ISHARES_PRODUCT_URLS[ticker] || "https://www.ishares.com";
@@ -381,76 +373,15 @@ function renderDetail(d) {
       <td>${fmt(h.dirty_mid, 4)}</td>`;
     hb.appendChild(tr);
   });
-
-  renderHistory(d.history || []);
 }
 
-function renderHistory(history) {
-  const ctx = document.getElementById("historyChart");
-  const labels = history.map((h) => h.curve_date);
-  const values = history.map((h) => h.premium_bps);
-  if (historyChart) historyChart.destroy();
-  historyChart = new Chart(ctx, {
-    type: "line",
-    data: {
-      labels,
-      datasets: [{
-        data: values,
-        borderColor: "#00ff88",
-        backgroundColor: "transparent",
-        fill: false,
-        pointRadius: 2,
-        tension: 0.1,
-      }],
-    },
-    options: {
-      plugins: { legend: { display: false } },
-      scales: {
-        x: { ticks: { color: "#666" }, grid: { color: "#1a1a1a" } },
-        y: { ticks: { color: "#666" }, grid: { color: "#1a1a1a" } },
-      },
-    },
-  });
-}
-
-// ---- Search + discover (500ms debounce) ----
-let debounceTimer = null;
+// ---- Status note (null-safe; the search note element was removed) ----
 function setNote(msg, cls) {
   const el = document.getElementById("discoverNote");
+  if (!el) return;
   el.textContent = msg;
   el.className = "discover-note " + (cls || "");
 }
-
-document.getElementById("search").addEventListener("input", (e) => {
-  const ticker = e.target.value.trim().toUpperCase();
-  clearTimeout(debounceTimer);
-  if (!ticker) { setNote(""); return; }
-  debounceTimer = setTimeout(async () => {
-    try {
-      const d = await api("/api/discover?ticker=" + encodeURIComponent(ticker));
-      setNote(`${d.name} | ${d.category} (${d.provider})`, "ok");
-    } catch (err) {
-      setNote(err.message, "err");
-    }
-  }, 500);
-});
-
-document.getElementById("addBtn").onclick = async () => {
-  const ticker = document.getElementById("search").value.trim().toUpperCase();
-  if (!ticker) return;
-  setNote("Adding " + ticker + "...", "dim");
-  try {
-    const d = await api("/api/watchlist/add", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ticker }),
-    });
-    setNote(`Added ${d.ticker}: ${d.holdings} Treasury holdings`, "ok");
-    loadWatchlist();
-  } catch (err) {
-    setNote(err.message, "err");
-  }
-};
 
 document.getElementById("runAllBtn").onclick = async (e) => {
   e.target.disabled = true;
