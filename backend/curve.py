@@ -76,6 +76,7 @@ TREASURY_CSV_URL = (
 # headers like "1 Mo", "3 Mo", "1 Yr", "10 Yr".
 TREASURY_COLUMN_TENORS: dict[str, float] = {
     "1 Mo": 1.0 / 12.0,
+    "1.5 Mo": 1.5 / 12.0,
     "2 Mo": 2.0 / 12.0,
     "3 Mo": 3.0 / 12.0,
     "4 Mo": 4.0 / 12.0,
@@ -256,6 +257,89 @@ def download_fred_par_yields(valuation_date: date, api_key: str) -> dict[float, 
 # ---------------------------------------------------------------------------
 
 
+def _edge_tangent(d_near: float, d_far: float, h_near: float, h_far: float) -> float:
+    """End-node tangent for monotone cubic, with a shape-preserving limiter.
+
+    Uses the non-centered three-point slope estimate (as in PCHIP), then clamps it
+    so the end interval cannot overshoot: the tangent is zeroed if it points
+    against the adjacent secant, and capped at three times the secant otherwise.
+    """
+    m = ((2.0 * h_near + h_far) * d_near - h_near * d_far) / (h_near + h_far)
+    if np.sign(m) != np.sign(d_near):
+        return 0.0
+    if np.sign(d_near) != np.sign(d_far) and abs(m) > 3.0 * abs(d_near):
+        return 3.0 * d_near
+    return m
+
+
+def monotone_cubic_interpolate(
+    x_known: np.ndarray, y_known: np.ndarray, x_query: np.ndarray
+) -> np.ndarray:
+    """Shape-preserving monotone cubic (PCHIP / Fritsch-Carlson) interpolation.
+
+    Hand-rolled to avoid a scipy dependency on the small droplet. It fits a
+    piecewise cubic Hermite whose node tangents are limited by the Fritsch-Carlson
+    method, so the interpolant is monotone on each interval and never overshoots
+    between nodes. This matches the spirit of the Treasury's own monotone-convex
+    par-curve method and removes the long-end overshoot that plain linear
+    interpolation produced across the sparse 10y/20y/30y par nodes.
+
+    Tangents:
+      - interior nodes: zero at a local extremum (sign change or a flat secant),
+        otherwise the Fritsch-Carlson weighted harmonic mean of the two secants;
+      - end nodes: a one-sided estimate passed through a shape-preserving limiter.
+
+    Beyond the first and last node the nearest value is held flat, matching the
+    previous extrapolation behaviour.
+    """
+    x = np.asarray(x_known, dtype=float)
+    y = np.asarray(y_known, dtype=float)
+    n = len(x)
+    xq = np.asarray(x_query, dtype=float)
+    if n == 1:
+        return np.full_like(xq, y[0])
+
+    h = np.diff(x)            # interval widths
+    delta = np.diff(y) / h    # secant slopes
+    m = np.zeros(n)           # node tangents
+
+    for i in range(1, n - 1):
+        if delta[i - 1] == 0.0 or delta[i] == 0.0 or delta[i - 1] * delta[i] < 0.0:
+            m[i] = 0.0  # local extremum: flat tangent preserves shape
+        else:
+            w1 = 2.0 * h[i] + h[i - 1]
+            w2 = h[i] + 2.0 * h[i - 1]
+            m[i] = (w1 + w2) / (w1 / delta[i - 1] + w2 / delta[i])
+
+    if n == 2:
+        m[0] = m[1] = delta[0]
+    else:
+        m[0] = _edge_tangent(delta[0], delta[1], h[0], h[1])
+        m[-1] = _edge_tangent(delta[-1], delta[-2], h[-1], h[-2])
+
+    out = np.empty_like(xq)
+    idx = np.clip(np.searchsorted(x, xq) - 1, 0, n - 2)
+    for j, xv in enumerate(xq):
+        if xv <= x[0]:
+            out[j] = y[0]
+        elif xv >= x[-1]:
+            out[j] = y[-1]
+        else:
+            i = idx[j]
+            t = (xv - x[i]) / h[i]
+            t2 = t * t
+            t3 = t2 * t
+            h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+            h10 = t3 - 2.0 * t2 + t
+            h01 = -2.0 * t3 + 3.0 * t2
+            h11 = t3 - t2
+            out[j] = (
+                h00 * y[i] + h10 * h[i] * m[i]
+                + h01 * y[i + 1] + h11 * h[i] * m[i + 1]
+            )
+    return out
+
+
 def bootstrap_zero_curve(
     par_yields: dict[float, float], curve_date: date
 ) -> TreasuryCurve:
@@ -263,9 +347,10 @@ def bootstrap_zero_curve(
 
     Steps, all under the semiannual convention documented at module level:
 
-    1. Linearly interpolate the published par yields onto a complete semiannual
-       grid (0.5, 1.0, 1.5, ... up to the longest published tenor). Coupons fall
-       on this grid, so we need a par yield at every grid point.
+    1. Interpolate the published par yields onto a complete semiannual grid
+       (0.5, 1.0, 1.5, ... up to the longest published tenor) using shape-
+       preserving monotone cubic interpolation, so coupons have a par yield at
+       every grid point without the long-end overshoot of linear interpolation.
     2. Walk the grid shortest first. At each tenor the par bond prices to 100, and
        every earlier discount factor is already known, so we solve the one
        remaining discount factor directly with the bootstrap formula.
@@ -282,14 +367,14 @@ def bootstrap_zero_curve(
     n_steps = int(round(max_tenor / step))
     grid_times = np.array([step * (i + 1) for i in range(n_steps)])
 
-    # Linear interpolation of par yields onto the grid. Below the shortest and
+    # Shape-preserving monotone cubic interpolation of par yields onto the grid.
+    # Linear interpolation across the sparse long-end nodes (10y, 20y, 30y)
+    # underestimated yields in the 11-19y and 21-29y buckets and overpriced those
+    # bonds; the monotone cubic removes that overshoot. Below the shortest and
     # above the longest published tenor the nearest yield is held flat.
     known_tenors = np.array(tenors)
     known_yields = np.array([par_yields[t] for t in tenors])
-    grid_par = np.interp(
-        grid_times, known_tenors, known_yields,
-        left=known_yields[0], right=known_yields[-1],
-    )
+    grid_par = monotone_cubic_interpolate(known_tenors, known_yields, grid_times)
 
     # Bootstrap discount factors sequentially.
     discount_factors = np.zeros(n_steps)
