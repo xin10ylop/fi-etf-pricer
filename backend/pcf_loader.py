@@ -540,20 +540,41 @@ def parse_ishares_spreadsheetml(raw_text: str) -> ParsedPCF:
                 }
             )
         else:
-            # Every NON-Treasury row (money market, cash, derivatives) is a
-            # cash-equivalent and flows into the cash component at its file Market
-            # Value, preserving sign. We never pick a single row: securities
-            # lending collateral and the USD cash line must both be summed.
-            cash_component += market_value
-            cash_lines.append(f"{name} [{asset_class}] {market_value:,.2f}")
+            # A non-Treasury row. Genuine fund cash (Asset Class "Cash") is added
+            # at its file Market Value. Securities-lending cash collateral sweeps
+            # (Asset Class "Money Market", e.g. "BLK CSH FND TREASURY SL AGENCY")
+            # are shown in the file as a positive asset but carry an equal,
+            # offsetting collateral-payable liability that the file omits. iShares'
+            # published NAV reflects that liability, so to reconcile we SUBTRACT the
+            # collateral amount (back out the unmatched asset). We sum across all
+            # qualifying rows and preserve sign; vendor_mv_total above keeps every
+            # row unchanged for the bridge.
+            if asset_class == "Cash":
+                cash_component += market_value
+                cash_lines.append(
+                    f"INCLUDED  {name} [{asset_class}] {market_value:,.2f}"
+                )
+            elif asset_class == "Money Market":
+                cash_component -= market_value
+                cash_lines.append(
+                    f"SUBTRACTED (sec-lending collateral liability) "
+                    f"{name} [{asset_class}] {market_value:,.2f}"
+                )
+            else:
+                cash_lines.append(
+                    f"EXCLUDED  {name} [{asset_class}] {market_value:,.2f}"
+                )
 
     history = _parse_nav_history(raw_text)
     official_nav, official_nav_date = official_nav_for(history, as_of)
 
     console.log(
-        f"Cash component (net of {len(cash_lines)} non-Treasury rows): "
-        f"{cash_component:,.2f}"
+        f"Cash component {cash_component:,.2f} from {len(cash_lines)} non-Treasury "
+        f"rows (Money Market sec-lending collateral subtracted as its offsetting "
+        f"liability):"
     )
+    for line in cash_lines:
+        console.log(f"  {line}")
 
     return ParsedPCF(
         holdings=pd.DataFrame(holdings_rows),
